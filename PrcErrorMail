@@ -1,0 +1,112 @@
+USE [DATACUBE_DWH]
+GO
+/****** Object:  StoredProcedure [dbo].[PrcErrorMail]    Script Date: 12/27/2018 11:37:50 AM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+ALTER PROCEDURE [dbo].[PrcErrorMail]  (@hours  int=24)
+AS 
+DECLARE @xml        NVARCHAR(max), 
+        @body       NVARCHAR(max), 
+        @xml_short  NVARCHAR(max), 
+        @body_short NVARCHAR(max), 
+        @count      INT = 0, 
+        @text       VARCHAR(250)
+
+-- select short error messages 
+SET @xml_short = Cast((SELECT DISTINCT e.operation_id  AS 'td', 
+                                       '', 
+                                       o.object_name  AS 'td', 
+                                       '', 
+									   convert(varchar, isnull(cast(o.start_time as smalldatetime),''), 120) as 'td',                                     
+                                       '', 
+                                       max(message)      AS 'td', 
+                                       '' 
+                      FROM   ssisdb.internal.operations o 
+                             JOIN ssisdb.internal.operation_messages m	ON o.operation_id = m.operation_id 
+                             JOIN ssisdb.internal.event_messages e		ON m.operation_id = e.operation_id 
+                                  AND m.operation_message_id = e.event_message_id 
+							 JOIN SSISDB.internal.executions ex			ON ex.execution_id = e.operation_id
+                      WHERE  m.message_type = 120 
+                             AND e.event_name = 'OnError' 
+                             AND m.message_time > Dateadd(hh, -@hours, Getdate()) 
+							 AND ex.folder_name = 'Hubble New'
+                      GROUP  BY e.operation_id , object_name , start_time
+					 order by 1 
+
+                       FOR xml path('tr'), elements) AS NVARCHAR(max)) 
+
+-- get all Error  in the last x hours (x= @hours)  
+SET @xml = Cast((SELECT m.operation_id                        AS 'td', 
+                        '', 
+                        o.object_name                         AS 'td', 
+                        '', 
+                        e.package_name                        AS 'td', 
+                        '', 
+                        e.message_source_name                 AS 'td', 
+                        '', 
+						convert(varchar, isnull(cast(m.message_time as smalldatetime),''), 120) as 'td',                         
+                        '', 
+                        m.message                             AS 'td' 
+                 FROM   ssisdb.internal.operations o 
+                        JOIN ssisdb.internal.operation_messages m ON o.operation_id = m.operation_id 
+                        JOIN ssisdb.internal.event_messages e     ON m.operation_id = e.operation_id 
+																 AND m.operation_message_id = e.event_message_id 
+						JOIN SSISDB.internal.executions ex		  ON ex.execution_id = e.operation_id
+                 WHERE  m.message_type = 120 
+                        --and Object_Name like '%perfect%'  
+                        AND e.event_name = 'OnError' 
+                        AND m.message_time > Dateadd(hh, -@hours, Getdate()) 
+						AND ex.folder_name = 'Hubble New'
+                 ORDER  BY 1 
+                 FOR xml path('tr'), elements) AS NVARCHAR(max)) 
+-- select number of Jobs that failed  
+SET @count = (SELECT Count(*) 
+              FROM   (SELECT ( m.operation_id ) 
+                      FROM   ssisdb.internal.operations o 
+                             JOIN ssisdb.internal.operation_messages m	ON o.operation_id = m.operation_id 
+                             JOIN ssisdb.internal.event_messages e		ON m.operation_id = e.operation_id 
+                                  AND m.operation_message_id =  e.event_message_id 
+							 JOIN SSISDB.internal.executions ex			ON ex.execution_id = e.operation_id
+                      WHERE  m.message_type = 120 
+                             AND e.event_name = 'OnError' 
+                             AND m.message_time > Dateadd(hh, -@hours, Getdate())
+							 AND ex.folder_name = 'Hubble New' 
+                      GROUP  BY m.operation_id) a) 
+
+IF @count = 0 --no jobs with error was found 
+  BEGIN 
+      EXEC msdb.dbo.Sp_send_dbmail 
+        @profile_name = 'dbmail', 
+        @recipients = 'michal@gmail.com', 
+        @subject = 'NO Jobs with Error Messages From ITG - TEST'; 
+  END 
+ELSE --Jobs with error was found 
+  BEGIN 
+      IF @count = 1 -- Just 1 Job was founr with error 
+        SET @text = Cast(@count AS VARCHAR(5)) 
+                    + ' Job Failed With Error in ITG - TEST' 
+      ELSE -- more then 1 Job was found with error 
+	    --BEGIN
+        SET @text = Cast(@count AS VARCHAR(5)) 
+                    + ' Jobs Failed With Error in ITG - TEST'; 
+
+	  SET @body = '<html><body><H3>All Error List</H3> <table border = 1>  <tr> <th> operation_id </th> <th> solution_name </th> <th> package_name </th> <th> task_name </th> <th> message_time </th> <th> message </th> </tr>'
+	  SET @body = @body + @xml + '</table></body></html>' 
+
+	  SET @body_short = '<html><body><H3>Short Error List</H3> <table border = 1>  <tr> <th> operation_id </th>  <th> package_name </th>  <th> message_time </th> <th> message </th> </tr>'
+	  SET @body_short = @body_short + @xml_short  + '</table></body></html>' 
+
+	  SET @body = @body_short + @body 
+		--END
+	  EXEC msdb.dbo.Sp_send_dbmail 
+            @profile_name = 'dbmail', 
+            @recipients = 'michal@gmail.com', 
+            @body = @body, 
+            @body_format ='HTML', 
+            @subject = @text; 
+END
